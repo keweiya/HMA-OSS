@@ -88,3 +88,9 @@ xposed/
 
 # ide files
 .vscode/
+
+# fork layer
+fork-keys/
+update.json
+__pycache__/
+*.pyc

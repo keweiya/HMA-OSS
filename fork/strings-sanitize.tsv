@@ -1,0 +1,27 @@
+# Token level sanitising for app/src/main/res/values*/strings.xml
+#
+# Format: <python regular expression>\t<replacement>, applied case insensitively
+# to every locale, in file order (put the more specific rule first).
+#
+# Replacements are deliberately language neutral (a brand name, or a Latin
+# word), so the sentences stay readable in all 26 locales without hand
+# translating them.
+
+HMA\s*/\s*HMAL	{project_name}
+HMA-OSS	{project_name}
+HMA-SSS	{project_name}
+HMA	{project_name}
+
+（如\s*ZygiskNext）	
+\(e\.g\.\s*ZygiskNext\)	
+ZygiskNext	{project_name}
+Zygisk	{project_name}
+
+LSPosed\s*/\s*Xposed	Xposed
+Xposed\s*/\s*LSPosed	Xposed
+LSPosed	Xposed
+
+”隐藏应用列表“	
+“隐藏应用列表”	
+"隐藏应用列表"	
+隐藏应用列表	

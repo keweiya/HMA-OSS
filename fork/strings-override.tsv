@@ -1,0 +1,12 @@
+# Whole string overrides, applied after fork/strings-sanitize.tsv.
+#
+# The key is removed from every values-*/strings.xml (so no locale can bring the
+# old wording back) and the value below is written to values/strings.xml.
+#
+# Format: name<TAB>value  (\n is written as an escaped newline)
+#
+# sick_mode_notice: the upstream text mixes the names of two *other* apps
+# ("HMA/HMAL ... HMA-OSS") in a way that cannot be token-replaced without
+# producing nonsense, so the message is replaced as a whole.
+
+sick_mode_notice	This module can read configuration backups written by other app-list hiding modules. If another one is installed, uninstall it and reboot first.

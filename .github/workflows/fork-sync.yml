@@ -1,0 +1,51 @@
+name: 同步上游代码
+
+# 每天定时把 fork 层提交变基到上游 master 并推送，只同步代码，
+# 不构建、不发版（发版见「检测上游新版本并发布」）。
+
+on:
+  schedule:
+    # 每天 04:17 UTC，即北京时间 12:17
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_SLUG: frknkrc44/HMA-OSS
+  UPSTREAM_BRANCH: master
+
+jobs:
+  sync:
+    name: 同步上游代码
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取本仓库代码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          fetch-depth: 0
+
+      - name: 添加上游远端
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_SLUG}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_SLUG}.git"
+
+      - name: 把 fork 层变基到上游 master
+        id: sync
+        run: scripts/fork_sync.sh
+
+      - name: 输出同步结果
+        run: |
+          set -euo pipefail
+          {
+            echo "## 同步上游代码"
+            echo
+            echo "- 上游 master：\`${{ steps.sync.outputs.upstream_sha }}\`"
+            echo "- 本仓库 master：\`${{ steps.sync.outputs.fork_sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

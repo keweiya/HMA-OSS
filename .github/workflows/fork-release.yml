@@ -1,0 +1,363 @@
+name: 检测上游新版本并发布
+
+# Mirrors upstream releases: runs every day, but only publishes anything when
+# upstream actually put out a new release that this fork has not mirrored yet.
+# A run with nothing to do finishes in a few seconds with the release job
+# skipped.
+#
+# Deliberately independent from fork-sync.yml: it materializes the upstream
+# release commit itself, so it works even when the daily sync has not run yet.
+
+on:
+  schedule:
+    # every day at 06:43 UTC (14:43 Asia/Shanghai)
+    - cron: '43 6 * * *'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'upstream release tag to mirror (default: the latest upstream release)'
+        type: string
+        default: ''
+      force:
+        description: 'republish even when this fork already mirrored that tag'
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_SLUG: frknkrc44/HMA-OSS
+  UPSTREAM_BRANCH: master
+
+jobs:
+  check:
+    name: 检测上游是否有新版本
+    runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.check.outputs.new_release }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_sha: ${{ steps.check.outputs.release_sha }}
+    steps:
+      - name: 检测上游最新发行版
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/${UPSTREAM_SLUG}/releases/latest" --jq .tag_name)"
+          fi
+          echo "upstream release: $tag"
+
+          new=false
+          if [ "$FORCE" = "true" ]; then
+            new=true
+            echo "forced rebuild requested"
+          elif gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag is already mirrored by this fork"
+          else
+            new=true
+          fi
+
+          sha="$(gh api "repos/${UPSTREAM_SLUG}/commits/$tag" --jq .sha)"
+          {
+            echo "release_tag=$tag"
+            echo "release_sha=$sha"
+            echo "new_release=$new"
+          } >> "$GITHUB_OUTPUT"
+          echo "release sha: $sha (publish: $new)"
+
+          {
+            echo "## 上游版本检测"
+            echo
+            echo "- 上游最新发行版：\`$tag\`"
+            echo "- 对应提交：\`$sha\`"
+            if [ "$new" = "true" ]; then
+              echo "- 处理方式：**构建并发布**"
+            else
+              echo "- 处理方式：本仓库已镜像过该版本，本轮不发版"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: 构建并发布
+    needs: check
+    if: ${{ needs.check.outputs.new_release == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取本仓库代码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: 检查签名密钥是否已配置
+        env:
+          KEYSTORE: ${{ secrets.FORK_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE" ]; then
+            echo "::error::FORK_KEYSTORE_B64 is not configured. Run scripts/fork_gen_keystore.sh, then set FORK_KEYSTORE_B64, FORK_KEYSTORE_PASSWORD, FORK_KEY_ALIAS and FORK_KEY_PASSWORD as repository secrets."
+            exit 1
+          fi
+
+      - name: 取出上游发行版对应的代码
+        id: source
+        env:
+          TAG: ${{ needs.check.outputs.release_tag }}
+          SHA: ${{ needs.check.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_SLUG}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_SLUG}.git"
+          # fetch into a private ref namespace so it can never clash with our own tags
+          git fetch --no-tags upstream "+refs/tags/${TAG}:refs/upstream-tags/${TAG}"
+          git fetch --no-tags upstream "$SHA" || true
+
+          git checkout --detach "$SHA"
+          git submodule update --init --recursive
+
+          # the fork layer is version independent: take it from our own branch
+          git checkout "origin/${UPSTREAM_BRANCH}" -- scripts fork FORK.md .github/workflows
+
+          # versionName/versionCode come from the commit count of
+          # refs/remotes/origin/master.  Pin that ref to the upstream release
+          # commit so this fork reports exactly the upstream version (oss-N)
+          # instead of upstream + our layer commit.
+          git update-ref refs/remotes/origin/master "$SHA"
+          count="$(git rev-list refs/remotes/origin/master --count)"
+          echo "upstream commits: $count -> versionName oss-$((count - 432))"
+          {
+            echo "expected_version=oss-$((count - 432))"
+            echo "upstream_sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 写入构建配置与签名密钥
+        env:
+          KEYSTORE: ${{ secrets.FORK_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.FORK_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FORK_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FORK_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE" | base64 --decode > key.jks
+          {
+            echo "officialBuild=true"
+            echo "fileDir=$(pwd)/key.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> local.properties
+
+      - name: 应用本分支的发行身份
+        run: python3 scripts/fork_identity.py apply --check-anchors
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.config/.android/debug.keystore
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: 准备调试签名（模块 debug 变体需要）
+        run: |
+          mkdir -p ~/.config/.android
+          ln -sfn ~/.config/.android ~/.android
+          if [ ! -f ~/.config/.android/debug.keystore ]; then
+            keytool -genkey -v -keystore ~/.config/.android/debug.keystore \
+              -alias androiddebugkey -storepass android -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: 构建
+        run: |
+          set -euo pipefail
+          ./gradlew prebuild
+          ./gradlew :app:assemble
+          ./gradlew :zygote:assemble
+
+      - name: 收集产物
+        id: artifacts
+        run: |
+          set -euo pipefail
+          release_zip="$(ls zygote/build/outputs/magisk/release/*.zip)"
+          debug_zip="$(ls zygote/build/outputs/magisk/debug/*.zip)"
+          release_apk="$(ls app/build/outputs/apk/release/*.apk | head -1)"
+          {
+            echo "release_zip=$release_zip"
+            echo "debug_zip=$debug_zip"
+            echo "release_apk=$release_apk"
+          } >> "$GITHUB_OUTPUT"
+          ls -l "$release_zip" "$debug_zip" "$release_apk"
+          echo "--- module.prop ---"
+          unzip -p "$release_zip" module.prop
+
+      - name: 校验产物身份
+        run: |
+          scripts/fork_verify_artifacts.sh \
+            --apk "${{ steps.artifacts.outputs.release_apk }}" \
+            --expected-version "${{ steps.source.outputs.expected_version }}" \
+            --module "${{ steps.artifacts.outputs.release_zip }}" \
+            --module "${{ steps.artifacts.outputs.debug_zip }}"
+
+      - name: 生成模块更新描述文件
+        env:
+          TAG: ${{ needs.check.outputs.release_tag }}
+          APK: ${{ steps.artifacts.outputs.release_apk }}
+          ZIP: ${{ steps.artifacts.outputs.release_zip }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          aapt2="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          badging="$("$aapt2" dump badging "$APK" | head -1)"
+          version_name="$(printf '%s' "$badging" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")"
+          version_code="$(printf '%s' "$badging" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")"
+          echo "versionName=$version_name versionCode=$version_code"
+          if [ "$version_name" != "$TAG" ]; then
+            echo "::error::built versionName $version_name does not match the release tag $TAG"
+            exit 1
+          fi
+
+          export ASSET_NAME="$(basename "$ZIP")"
+          export VERSION_CODE="$version_code"
+          export TAG
+          python3 - <<'PY' > update.json
+          import json, os
+          tag = os.environ["TAG"]
+          repo = os.environ["GH_REPO"]
+          print(json.dumps({
+              "version": tag,
+              "versionCode": int(os.environ["VERSION_CODE"]),
+              "zipUrl": f"https://github.com/{repo}/releases/download/{tag}/{os.environ['ASSET_NAME']}",
+              "changelog": f"https://github.com/{repo}/releases/tag/{tag}",
+          }, indent=2))
+          PY
+          cat update.json
+
+      - name: 渲染中文发行说明
+        env:
+          TAG: ${{ needs.check.outputs.release_tag }}
+          SHA: ${{ needs.check.outputs.release_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${UPSTREAM_SLUG}/releases/tags/${TAG}" --jq .body > upstream-notes.md 2>/dev/null || : > upstream-notes.md
+          [ -s upstream-notes.md ] || printf '%s\n' "（上游本次发行没有填写更新说明）" > upstream-notes.md
+
+          # 上游说明：优先用本仓库人工校对的中文翻译，其次机器翻译，最后保留英文原文
+          notes_source="人工校对"
+          if [ -f "fork/upstream-notes-zh/${TAG}.md" ]; then
+            cp "fork/upstream-notes-zh/${TAG}.md" upstream-notes-zh.md
+          elif python3 scripts/translate_notes.py upstream-notes.md > upstream-notes-zh.md 2> translate.log; then
+            notes_source="机器翻译，未人工校对"
+          else
+            cat translate.log || true
+            cp upstream-notes.md upstream-notes-zh.md
+            notes_source="机器翻译暂不可用，以下为英文原文"
+          fi
+          echo "上游说明处理方式：$notes_source"
+
+          eval "$(python3 - <<'PY'
+          cfg = {}
+          for line in open("fork/fork.env", encoding="utf-8"):
+              line = line.strip()
+              if line and not line.startswith("#") and "=" in line:
+                  key, value = line.split("=", 1)
+                  cfg[key.strip()] = value.strip()
+          for key in ("APP_ID", "MODULE_ID", "MODULE_NAME", "PROJECT_NAME"):
+              print(f'{key}="{cfg[key]}"')
+          PY
+          )"
+
+          python3 - "$TAG" "$SHA" "$APP_ID" "$MODULE_ID" "$MODULE_NAME" "$PROJECT_NAME" "$GITHUB_REPOSITORY" "$notes_source" <<'PY' > release-notes.md
+          import sys
+          (tag, sha, app_id, module_id, module_name,
+           project_name, repo, notes_source) = sys.argv[1:9]
+          template = open("fork/release-notes-zh.md", encoding="utf-8").read()
+          upstream = open("upstream-notes.md", encoding="utf-8").read().strip()
+          upstream_zh = open("upstream-notes-zh.md", encoding="utf-8").read().strip()
+          # drop the maintenance header of the template (leading # lines)
+          lines = template.splitlines(keepends=True)
+          while lines and (lines[0].lstrip().startswith("#") or not lines[0].strip()):
+              lines.pop(0)
+          template = "".join(lines)
+          for key, value in (
+              ("TAG", tag), ("SHA", sha), ("APP_ID", app_id), ("MODULE_ID", module_id),
+              ("MODULE_NAME", module_name), ("PROJECT_NAME", project_name),
+              ("REPO", repo), ("UPSTREAM_SLUG", "frknkrc44/HMA-OSS"),
+              ("UPSTREAM_NOTES_SOURCE", notes_source),
+              ("UPSTREAM_NOTES_ZH", upstream_zh), ("UPSTREAM_NOTES", upstream),
+          ):
+              template = template.replace("{{" + key + "}}", value)
+          sys.stdout.write(template)
+          PY
+
+          head -60 release-notes.md
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "${{ steps.artifacts.outputs.release_zip }}"
+            "${{ steps.artifacts.outputs.debug_zip }}"
+            app/src/main/assets/translators.json
+            update.json
+          )
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists, refreshing its assets"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG（跟随上游发行版重新构建）" --notes-file release-notes.md --latest
+          else
+            # no --target on purpose: forks inherit upstream's tags, and gh keeps
+            # an existing tag as is; when the tag is missing it is created from
+            # the default branch (master) anyway.
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG（跟随上游发行版重新构建）" \
+              --notes-file release-notes.md \
+              --latest \
+              "${assets[@]}"
+          fi
+
+          # drop assets this build no longer produces (e.g. after a rename)
+          keep="$(printf '%s\n' "${assets[@]}" | xargs -n1 basename | tr '\n' ' ')"
+          for existing in $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+            case " $keep " in
+              *" $existing "*) ;;
+              *) echo "删除已废弃的资产 $existing"; gh release delete-asset "$TAG" "$existing" --repo "$GITHUB_REPOSITORY" --yes ;;
+            esac
+          done
+          echo "--- 当前资产 ---"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 
+
+      - name: 输出汇总
+        if: always()
+        run: |
+          {
+            echo "## ${{ needs.check.outputs.release_tag }}"
+            echo
+            echo "- 上游提交：\`${{ needs.check.outputs.release_sha }}\`"
+            echo "- 期望版本名：\`${{ steps.source.outputs.expected_version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
