@@ -41,17 +41,63 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
+      # The fork must not ship the upstream identity: package id, launcher label,
+      # module id and state directory are rewritten before Gradle configures.
+      # See branding.properties / scripts/apply_branding.py
+      - name: Apply fork branding
+        run: |
+          set -euo pipefail
+          python3 scripts/apply_branding.py
+          python3 scripts/apply_branding.py --check
+          {
+            echo "### Fork branding"
+            echo ""
+            echo "| key | value |"
+            echo "| --- | --- |"
+            grep -E '^(appId|appLabel|codename|iconSeed)=' branding.properties \
+              | sed -E 's/^([^=]+)=(.*)$/| \1 | \2 |/'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Write key
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        env:
+          # this fork stores its signing material under FORK_*, the upstream
+          # names are still accepted as a fallback
+          KEY_STORE_B64: ${{ secrets.FORK_KEYSTORE_B64 || secrets.KEY_STORE }}
+          KEY_STORE_PASSWORD: ${{ secrets.FORK_KEYSTORE_PASSWORD || secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FORK_KEY_ALIAS || secrets.ALIAS }}
+          KEY_ALIAS_PASSWORD: ${{ secrets.FORK_KEY_PASSWORD || secrets.ALIAS_KEY_PASSWORD }}
+          CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+          CROWDIN_API_TOKEN: ${{ secrets.CROWDIN_LIST_MEMBERS_API_TOKEN }}
         run: |
+          set -euo pipefail
+          touch local.properties
           echo officialBuild=true >> local.properties
-          echo storePassword='${{ secrets.KEY_STORE_PASSWORD }}' >> local.properties
-          echo keyAlias='${{ secrets.ALIAS }}' >> local.properties
-          echo keyPassword='${{ secrets.ALIAS_KEY_PASSWORD }}' >> local.properties
-          echo fileDir=`pwd`/key.jks >> local.properties
-          echo crowdinProjectId='${{ secrets.CROWDIN_PROJECT_ID }}' >> local.properties
-          echo crowdinApiKey='${{ secrets.CROWDIN_LIST_MEMBERS_API_TOKEN }}' >> local.properties
-          echo "${{ secrets.KEY_STORE }}" | base64 --decode > key.jks
+          echo "crowdinProjectId=${CROWDIN_PROJECT_ID}" >> local.properties
+          echo "crowdinApiKey=${CROWDIN_API_TOKEN}" >> local.properties
+
+          # A release without the original signing key can never update an
+          # installed build, so publish runs refuse to start without it
+          # instead of failing deep inside Gradle (or shipping a dead APK).
+          if [ -z "${KEY_STORE_B64}" ]; then
+            echo "::error title=Missing signing key::Repository secrets FORK_KEYSTORE_B64 / FORK_KEYSTORE_PASSWORD / FORK_KEY_ALIAS / FORK_KEY_PASSWORD (or the upstream KEY_STORE / KEY_STORE_PASSWORD / ALIAS / ALIAS_KEY_PASSWORD) are empty. Builds published from master must be signed with the same keystore as the previous releases (oss-173 and newer), otherwise they cannot be installed over them."
+            exit 1
+          fi
+
+          printf '%s' "${KEY_STORE_B64}" | base64 --decode > key.jks
+          if [ ! -s key.jks ]; then
+            echo "::error title=Broken signing key::key.jks is empty after base64 decoding, check FORK_KEYSTORE_B64."
+            exit 1
+          fi
+          if ! keytool -list -keystore key.jks -storepass "${KEY_STORE_PASSWORD}" >/dev/null 2>&1; then
+            echo "::error title=Broken signing key::key.jks cannot be opened with the configured password, check FORK_KEYSTORE_B64 / FORK_KEYSTORE_PASSWORD."
+            exit 1
+          fi
+
+          echo storePassword="${KEY_STORE_PASSWORD}" >> local.properties
+          echo keyAlias="${KEY_ALIAS}" >> local.properties
+          echo keyPassword="${KEY_ALIAS_PASSWORD}" >> local.properties
+          echo fileDir="$(pwd)/key.jks" >> local.properties
 
       - name: Cache gradle
         uses: actions/cache@v6
@@ -59,8 +105,9 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
-          restore-keys: ${{ runner.os }}-gradle-
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
       - name: Gradle prebuild
         run: |
@@ -69,19 +116,75 @@ jobs:
       - name: Build APK
         id: buildAPK
         run: |
-          ./gradlew :app:assemble
-          echo "translatorsJson=$(find app/build/generated -name translators.json -print -quit)" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          ./gradlew :app:assemble --stacktrace 2>&1 | tee build-apk.log
+          translators=$(find app/build/generated -name translators.json -print -quit || true)
+          if [ -n "${translators}" ]; then
+            cp "${translators}" translators.json
+          else
+            echo "::warning::translators.json was not generated, it will not be published"
+          fi
+
+      - name: Build failure details
+        if: failure()
+        run: |
+          if [ -f build-apk.log ]; then
+            tail -n 120 build-apk.log >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+
+      - name: Save build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: build-apk.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Verify branded APK
+        run: |
+          set -euo pipefail
+          build_tools=$(ls -d "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+          aapt2="${build_tools}/aapt2"
+          apk=$(find app/build/outputs/apk/debug -name '*.apk' -print -quit)
+          expected_id=$(grep -E '^appId=' branding.properties | cut -d= -f2-)
+          expected_label=$(grep -E '^appLabel=' branding.properties | cut -d= -f2-)
+          expected_module=$(grep -E '^codename=' branding.properties | cut -d= -f2-)
+
+          echo "APK: ${apk}"
+          "${aapt2}" dump badging "${apk}" > badging.txt
+          head -n 5 badging.txt
+          grep -q "package: name='${expected_id}'" badging.txt \
+            || { echo "::error::APK package name is not ${expected_id} - branding was not applied"; exit 1; }
+          grep -q "application-label:'${expected_label}'" badging.txt \
+            || { echo "::error::APK label is not ${expected_label} - branding was not applied"; exit 1; }
+
+          # versionCode has to stay ahead of the previously published release,
+          # otherwise Android installers reject the update.
+          version_code=$(grep -oE "versionCode='[0-9]+'" badging.txt | tr -dc '0-9')
+          min_version_code=$(grep -E '^minVersionCode=' branding.properties | cut -d= -f2-)
+          echo "versionCode: ${version_code} (minimum ${min_version_code})"
+          if [ "${version_code}" -lt "${min_version_code}" ]; then
+            echo "::error::versionCode ${version_code} is lower than the previously published ${min_version_code}, this APK would not install as an update"
+            exit 1
+          fi
+
+          grep -qE "id = \"${expected_module}\"" zygote/build.gradle.kts \
+            || { echo "::error::Zygisk module id is not ${expected_module}"; exit 1; }
 
       - name: Upload APK mappings
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: app-mappings
           path: "app/build/outputs/mapping/release"
+          if-no-files-found: ignore
 
       - name: Build module
         id: buildModule
         run: |
-          ./gradlew :zygote:assemble
+          set -euo pipefail
+          ./gradlew :zygote:assemble 2>&1 | tee build-module.log
           echo "releaseName=$(ls zygote/build/outputs/magisk/release/*.zip | awk -F '(/|.zip)' '{print $6}')" >> $GITHUB_OUTPUT
           echo "debugName=$(ls zygote/build/outputs/magisk/debug/*.zip | awk -F '(/|.zip)' '{print $6}')" >> $GITHUB_OUTPUT
           echo "releaseFile=$(ls zygote/build/outputs/magisk/release/*.zip)" >> $GITHUB_OUTPUT
@@ -94,12 +197,14 @@ jobs:
           archive: false
           name: ${{ steps.buildModule.outputs.releaseName }}
           path: ${{ steps.buildModule.outputs.releaseFile }}
+          if-no-files-found: error
 
       - name: Upload module mappings
         uses: actions/upload-artifact@v7
         with:
           name: zygote-mappings
           path: "zygote/build/outputs/mapping/release"
+          if-no-files-found: ignore
 
       - name: Upload debug
         uses: actions/upload-artifact@v7
@@ -107,28 +212,35 @@ jobs:
           archive: false
           name: ${{ steps.buildModule.outputs.debugName }}
           path: ${{ steps.buildModule.outputs.debugFile }}
+          if-no-files-found: error
 
       - name: Upload to GitHub release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v3
         with:
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           token: ${{ secrets.GITHUB_TOKEN }}
           name: oss-${{ steps.buildModule.outputs.ossNum }}
           body: ${{ github.event.head_commit.message }}
           files: |
             ${{ steps.buildModule.outputs.releaseFile }}
             ${{ steps.buildModule.outputs.debugFile }}
-            ${{ steps.buildAPK.outputs.translatorsJson }}
+            translators.json
           tag_name: oss-${{ steps.buildModule.outputs.ossNum }}
 
       - name: Post to channel
         if: ${{ github.event_name != 'pull_request' && success() && github.ref == 'refs/heads/master' }}
+        continue-on-error: true
         env:
           CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           COMMIT_URL: ${{ github.event.head_commit.url }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
+          if [ -z "${BOT_TOKEN}" ] || [ -z "${CHANNEL_ID}" ]; then
+            echo "Telegram secrets are not configured, skipping channel post."
+            exit 0
+          fi
           export release=${{ steps.buildModule.outputs.releaseFile }}
           export debug=${{ steps.buildModule.outputs.debugFile }}
           ESCAPED=`python3 -c 'import json,os,urllib.parse; msg = json.dumps(os.environ["COMMIT_MESSAGE"]); print(urllib.parse.quote(msg if len(msg) <= 1024 else json.dumps(os.environ["COMMIT_URL"])))'`

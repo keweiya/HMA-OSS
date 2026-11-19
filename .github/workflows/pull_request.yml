@@ -28,6 +28,12 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
+      - name: Apply fork branding
+        run: |
+          set -euo pipefail
+          python3 scripts/apply_branding.py
+          python3 scripts/apply_branding.py --check
+
       - name: Prepare env
         run: |
           touch local.properties
@@ -41,7 +47,7 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
             ~/.config/.android/debug.keystore
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
           restore-keys: ${{ runner.os }}-gradle-
 
       - name: Gradle prebuild

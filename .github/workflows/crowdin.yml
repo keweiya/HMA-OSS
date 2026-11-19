@@ -14,7 +14,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Translations are maintained in the upstream project. This fork only
+      # syncs when it actually owns a Crowdin project (token configured),
+      # otherwise the job used to fail on every push touching strings.xml.
+      - name: Check Crowdin credentials
+        id: credentials
+        env:
+          CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+          CROWDIN_API_TOKEN: ${{ secrets.CROWDIN_API_TOKEN }}
+        run: |
+          if [ -n "${CROWDIN_PROJECT_ID}" ] && [ -n "${CROWDIN_API_TOKEN}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Crowdin skipped::CROWDIN_PROJECT_ID / CROWDIN_API_TOKEN are not configured for this repository, skipping the Crowdin sync."
+          fi
+
       - name: crowdin action
+        if: steps.credentials.outputs.enabled == 'true'
         uses: crowdin/github-action@master
         with:
           upload_translations: false

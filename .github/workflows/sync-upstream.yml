@@ -1,0 +1,65 @@
+name: Sync upstream
+
+# Keeps this fork on top of frknkrc44/HMA-OSS. A merged upstream commit lands on
+# master, which is what triggers the Main workflow (build + release).
+#
+# The fork itself carries no source changes (branding is applied at build time),
+# so a merge only conflicts when upstream restructures the build scripts.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream master
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/frknkrc44/HMA-OSS.git
+          git fetch --no-tags upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "upstream is already merged, nothing to do"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream_head=$(git rev-parse --short upstream/master)
+          echo "merging upstream ${upstream_head}"
+
+          if ! git merge --no-edit -m "Merge upstream ${upstream_head}" upstream/master; then
+            git merge --abort || true
+            echo "::error title=Upstream merge conflict::Upstream ${upstream_head} conflicts with the fork, merge it manually."
+            exit 1
+          fi
+
+          git push origin HEAD:master
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      # pushes made with GITHUB_TOKEN do not start other workflows
+      - name: Trigger release build
+        if: steps.merge.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run main.yml --ref master

@@ -88,3 +88,13 @@ xposed/
 
 # ide files
 .vscode/
+
+# CI / branding artifacts
+key.jks
+badging.txt
+build-apk.log
+build-module.log
+
+# python
+__pycache__/
+*.pyc
